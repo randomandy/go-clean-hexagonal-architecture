@@ -234,6 +234,121 @@ type OrderRepository interface {
 
 ---
 
+### Decision 5: Testing Strategy
+
+> **Choice required:** How should code that depends on infrastructure (database, external services) be tested?
+
+Each layer has a clear testing approach. The domain, service, and handler layers are straightforward — the repository/storage layer is where the real decision lies.
+
+#### Layer-by-layer (recommended defaults)
+
+**Service tests** — mock the port interfaces (repository, external client). Pure unit tests with no infrastructure:
+
+```go
+func TestCreateOrder(t *testing.T) {
+    repo := mocks.NewMockOrderRepository(t)
+    repo.EXPECT().Create(mock.Anything, mock.Anything).Return(nil)
+
+    svc := service.NewOrderService(repo)
+    err := svc.CreateOrder(context.Background(), &domain.Order{ID: uuid.New()})
+    assert.NoError(t, err)
+}
+```
+
+**Handler tests** — mock the service interface. Verify HTTP status codes, response bodies, and request validation:
+
+```go
+func TestGetOrderHandler_NotFound(t *testing.T) {
+    svc := mocks.NewMockOrderService(t)
+    svc.EXPECT().GetOrder(mock.Anything, mock.Anything).Return(nil, ErrNotFound)
+
+    req := httptest.NewRequest("GET", "/orders/123", nil)
+    rec := httptest.NewRecorder()
+    handler := NewOrderHandler(svc)
+    handler.GetOrder(rec, req)
+
+    assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+```
+
+#### Repository/storage layer — the decision point
+
+This is where infrastructure meets application code. The choice affects test confidence, speed, and complexity.
+
+**Option A — Pure mocks (generated from interfaces).**
+
+A mock generator (mockery, gomock) produces mocks from port interfaces. Service and handler tests already cover this. Storage implementations themselves are not unit-tested.
+
+```go
+// Auto-generated mock from ports.OrderRepository
+repo := mocks.NewMockOrderRepository(t)
+repo.EXPECT().GetByID(mock.Anything, orderID).Return(&order, nil)
+```
+
+**Option B — Integration tests with testcontainers.**
+
+A real PostgreSQL container spins up per test suite. Tests run actual SQL/GORM queries against a real database, catching query bugs, migration issues, and GORM behavior that mocks miss.
+
+```go
+func TestOrderRepo_Create(t *testing.T) {
+    ctx := context.Background()
+    pg, err := postgres.Run(ctx, "postgres:16-alpine",
+        postgres.WithDatabase("test"),
+        testcontainers.WithWaitStrategy(
+            wait.ForListeningPort("5432/tcp"),
+        ),
+    )
+    t.Cleanup(func() { _ = pg.Terminate(ctx) })
+
+    db := connectGORM(t, pg)
+    db.AutoMigrate(&domain.Order{})
+
+    repo := storage.NewOrderRepository(db)
+    order := &domain.Order{ID: uuid.New(), Status: "pending"}
+    err = repo.Create(ctx, order)
+    assert.NoError(t, err)
+
+    found, err := repo.GetByID(ctx, order.ID)
+    assert.NoError(t, err)
+    assert.Equal(t, order.ID, found.ID)
+}
+```
+
+**Option C — In-memory fakes.**
+
+Hand-written implementations of port interfaces backed by maps/slices. Faster than testcontainers, more realistic than mocks, but require manual maintenance.
+
+```go
+type FakeOrderRepository struct {
+    orders map[uuid.UUID]*domain.Order
+    mu     sync.RWMutex
+}
+
+func (f *FakeOrderRepository) GetByID(_ context.Context, id uuid.UUID) (*domain.Order, error) {
+    f.mu.RLock()
+    defer f.mu.RUnlock()
+    order, ok := f.orders[id]
+    if !ok {
+        return nil, ErrNotFound
+    }
+    return order, nil
+}
+```
+
+| Consideration         | Option A (Mocks)      | Option B (Testcontainers) | Option C (Fakes)        |
+|-----------------------|-----------------------|---------------------------|-------------------------|
+| Speed                 | Fast                  | Slower (container startup) | Fast                   |
+| Confidence            | Low for storage layer | High — real DB behavior    | Medium                  |
+| Catches query bugs    | No                    | Yes                        | No                      |
+| Catches GORM issues   | No                    | Yes                        | No                      |
+| Transaction testing   | No                    | Yes                        | Possible but tricky     |
+| Maintenance           | Auto-generated        | Needs Docker in CI         | Manual upkeep           |
+| Recommended for       | Small projects, fast CI | Most projects             | Specific integration scenarios |
+
+A common combination: **Option A for service/handler tests + Option B for storage tests**. This gives fast unit tests where mocks suffice and real database confidence where it matters.
+
+---
+
 ## Domain Module Layers
 
 Each domain module follows six layers with strict dependency rules. Dependencies point inward: handlers -> service -> ports <- storage.
@@ -1061,6 +1176,7 @@ Swagger annotations on handlers, served at `/swagger/` endpoint. Generated with 
 - Standard Go testing with testify for assertions
 - Service tests mock repository and client adapter interfaces
 - Handler tests mock service interfaces
+- Repository/storage test approach depends on Decision 5 (Testing Strategy)
 - File naming: `*_test.go` for unit tests, `*_handler_test.go` / `*_handler_integration_test.go` for API tests
 
 ## Key Technologies
