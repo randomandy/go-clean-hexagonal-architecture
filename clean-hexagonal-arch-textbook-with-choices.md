@@ -15,9 +15,10 @@ A reference architecture for building Go REST APIs using Clean Architecture and 
 │   ├── api/                       # HTTP routing, middleware, route constants
 │   │   ├── server.go              # Server setup and route registration
 │   │   ├── routes.go              # Route path constants
-│   │   ├── middleware/             # Authentication, CORS, RBAC, request ID middleware
+│   │   ├── middleware/            # Authentication, CORS, RBAC, request ID middleware
 │   │   └── errors/                # Standardized error responses
 │   ├── common/                    # Shared utilities
+│   │   ├── errors/                # Domain error types
 │   │   └── transaction/           # Transaction manager
 │   └── <domain>/                  # One directory per business domain
 │       ├── domain/                # Core entities and business rules
@@ -242,6 +243,39 @@ Each layer has a clear testing approach. The domain, service, and handler layers
 
 #### Layer-by-layer (recommended defaults)
 
+**Domain tests** — if using rich domain models (Decision 2 Option B), domain entities are the easiest and most valuable code to test. No mocks, no setup — pure logic:
+
+```go
+func TestOrder_Cancel_WhenPending(t *testing.T) {
+    order := &domain.Order{Status: domain.OrderStatusPending}
+
+    err := order.Cancel()
+
+    assert.NoError(t, err)
+    assert.Equal(t, domain.OrderStatusCancelled, order.Status)
+}
+
+func TestOrder_Cancel_WhenAlreadyConfirmed(t *testing.T) {
+    order := &domain.Order{Status: domain.OrderStatusConfirmed}
+
+    err := order.Cancel()
+
+    assert.ErrorIs(t, err, domain.ErrCannotCancel)
+    assert.Equal(t, domain.OrderStatusConfirmed, order.Status) // unchanged
+}
+
+func TestOrder_AddItem_CalculatesTotal(t *testing.T) {
+    order := &domain.Order{}
+
+    order.AddItem(&domain.Item{Price: 100, Quantity: 2})
+    order.AddItem(&domain.Item{Price: 50, Quantity: 1})
+
+    assert.Equal(t, 250.0, order.Total)
+}
+```
+
+This is why rich domain models improve testability — invariant logic is tested without infrastructure.
+
 **Service tests** — mock the port interfaces (repository, external client). Pure unit tests with no infrastructure:
 
 ```go
@@ -260,7 +294,7 @@ func TestCreateOrder(t *testing.T) {
 ```go
 func TestGetOrderHandler_NotFound(t *testing.T) {
     svc := mocks.NewMockOrderService(t)
-    svc.EXPECT().GetOrder(mock.Anything, mock.Anything).Return(nil, ErrNotFound)
+    svc.EXPECT().GetOrder(mock.Anything, mock.Anything).Return(nil, commonerrors.ErrNotFound)
 
     req := httptest.NewRequest("GET", "/orders/123", nil)
     rec := httptest.NewRecorder()
@@ -298,18 +332,23 @@ func TestOrderRepo_Create(t *testing.T) {
             wait.ForListeningPort("5432/tcp"),
         ),
     )
+    require.NoError(t, err)
     t.Cleanup(func() { _ = pg.Terminate(ctx) })
 
     db := connectGORM(t, pg)
+
+    // Note: AutoMigrate with domain types assumes Decision 1 Option A (shared structs).
+    // For Option B, migrate with storage/model types instead.
     db.AutoMigrate(&domain.Order{})
 
-    repo := storage.NewOrderRepository(db)
-    order := &domain.Order{ID: uuid.New(), Status: "pending"}
+    repo := storage.NewOrderRepository(db, transaction.NewGormManager(db))
+    order := &domain.Order{ID: uuid.New(), Status: domain.OrderStatusPending}
+
     err = repo.Create(ctx, order)
-    assert.NoError(t, err)
+    require.NoError(t, err)
 
     found, err := repo.GetByID(ctx, order.ID)
-    assert.NoError(t, err)
+    require.NoError(t, err)
     assert.Equal(t, order.ID, found.ID)
 }
 ```
@@ -329,7 +368,7 @@ func (f *FakeOrderRepository) GetByID(_ context.Context, id uuid.UUID) (*domain.
     defer f.mu.RUnlock()
     order, ok := f.orders[id]
     if !ok {
-        return nil, ErrNotFound
+        return nil, commonerrors.ErrNotFound
     }
     return order, nil
 }
@@ -385,7 +424,7 @@ func (o *Order) Cancel() error {
     return nil
 }
 
-// Domain errors
+// Domain-specific errors (business rule violations)
 var (
     ErrCannotCancel = errors.New("order can only be cancelled while pending")
 )
@@ -420,17 +459,19 @@ type OrderRepository interface {
 }
 ```
 
-Domain-level sentinel errors also live in ports:
+**`errors.go`** — domain-specific error types that carry business context:
 ```go
-var ErrOrderNotFound = errors.New("order not found")
-
-type ErrOrderExists struct {
-    Reference string
+// Use for errors that carry domain-specific context beyond simple not-found/conflict
+type ErrInvalidStateTransition struct {
+    From, To OrderStatus
 }
 
-func (e *ErrOrderExists) Error() string {
-    return fmt.Sprintf("order already exists with reference '%s'", e.Reference)
+func (e *ErrInvalidStateTransition) Error() string {
+    return fmt.Sprintf("cannot transition order from %s to %s", e.From, e.To)
 }
+
+// For simple not-found cases, repositories wrap common.ErrNotFound with context:
+//   return nil, fmt.Errorf("order %s: %w", id, commonerrors.ErrNotFound)
 ```
 
 ### 3. Service (`service/`)
@@ -441,10 +482,15 @@ Business logic. Depends only on port interfaces, never on concrete implementatio
 type orderService struct {
     repo          ports.OrderRepository
     paymentClient PaymentClient
+    txManager     transaction.Manager
 }
 
-func NewOrderService(repo ports.OrderRepository, paymentClient PaymentClient) ports.OrderService {
-    return &orderService{repo: repo, paymentClient: paymentClient}
+func NewOrderService(
+    repo ports.OrderRepository,
+    paymentClient PaymentClient,
+    txManager transaction.Manager,
+) ports.OrderService {
+    return &orderService{repo: repo, paymentClient: paymentClient, txManager: txManager}
 }
 
 func (s *orderService) CreateOrder(ctx context.Context, order *domain.Order) error {
@@ -484,16 +530,15 @@ Repository implementation using GORM. Implements the repository interface from p
 
 ```go
 type orderRepository struct {
-    db        *gorm.DB
-    txManager transaction.Manager
+    db *gorm.DB
 }
 
-func NewOrderRepository(db *gorm.DB, txManager transaction.Manager) ports.OrderRepository {
-    return &orderRepository{db: db, txManager: txManager}
+func NewOrderRepository(db *gorm.DB) ports.OrderRepository {
+    return &orderRepository{db: db}
 }
 
 func (r *orderRepository) getDB(ctx context.Context) *gorm.DB {
-    if tx := r.txManager.GetTxFromContext(ctx); tx != nil {
+    if tx := transaction.GetTx(ctx); tx != nil {
         return tx
     }
     return r.db
@@ -503,9 +548,9 @@ func (r *orderRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Or
     var order domain.Order
     if err := r.getDB(ctx).WithContext(ctx).First(&order, "id = ?", id).Error; err != nil {
         if errors.Is(err, gorm.ErrRecordNotFound) {
-            return nil, ports.ErrOrderNotFound
+            return nil, fmt.Errorf("order %s: %w", id, commonerrors.ErrNotFound)
         }
-        return nil, err
+        return nil, fmt.Errorf("querying order %s: %w", id, err)
     }
     return &order, nil
 }
@@ -587,23 +632,23 @@ func NewOrderHandler(service ports.OrderService) *OrderHandler {
 // @Produce json
 // @Param request body dto.CreateOrderRequest true "Order to create"
 // @Success 201 {object} dto.OrderResponse
-// @Failure 400 {object} errors.ErrorResponse
+// @Failure 400 {object} apierrors.ErrorResponse
 // @Router /orders [post]
 func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
     var req dto.CreateOrderRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        errors.WriteErrorResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+        apierrors.HandleError(w, r, &commonerrors.ValidationError{Field: "body", Message: err.Error()})
         return
     }
 
     if err := req.Validate(); err != nil {
-        errors.WriteErrorResponse(w, http.StatusBadRequest, "Validation failed", err.Error())
+        apierrors.HandleError(w, r, &commonerrors.ValidationError{Field: "body", Message: err.Error()})
         return
     }
 
     order := req.ToDomain()
     if err := h.service.CreateOrder(r.Context(), order); err != nil {
-        handleServiceError(w, err)
+        apierrors.HandleError(w, r, err)
         return
     }
 
@@ -625,16 +670,16 @@ func Handle[Req Validatable, Resp any](
 ) {
     var req Req
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        errors.WriteErrorResponse(w, http.StatusBadRequest, "Invalid request", err.Error())
+        apierrors.HandleError(w, r, &commonerrors.ValidationError{Field: "body", Message: err.Error()})
         return
     }
     if err := req.Validate(); err != nil {
-        errors.WriteErrorResponse(w, http.StatusBadRequest, "Validation failed", err.Error())
+        apierrors.HandleError(w, r, &commonerrors.ValidationError{Field: "body", Message: err.Error()})
         return
     }
     resp, err := execute(r.Context(), req)
     if err != nil {
-        handleServiceError(w, err)
+        apierrors.HandleError(w, r, err)
         return
     }
     writeJSON(w, successCode, resp)
@@ -653,22 +698,6 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
         }
         return dto.ToResponse(order), nil
     }, http.StatusCreated)
-}
-```
-
-A shared `handleServiceError` function maps domain errors to HTTP status codes consistently:
-
-```go
-func handleServiceError(w http.ResponseWriter, err error) {
-    var existsErr interface{ Error() string }
-    switch {
-    case errors.As(err, &existsErr) && strings.Contains(err.Error(), "already exists"):
-        errors.WriteErrorResponse(w, http.StatusConflict, "Resource already exists", err.Error())
-    case errors.Is(err, ErrNotFound):
-        errors.WriteErrorResponse(w, http.StatusNotFound, "Not found", err.Error())
-    default:
-        errors.WriteErrorResponse(w, http.StatusInternalServerError, "Internal server error", "")
-    }
 }
 ```
 
@@ -700,11 +729,11 @@ func InitializeServices(cfg *AppConfig) (*ServiceContainer, error) {
     c.TxManager = transaction.NewGormManager(c.DB)
 
     // 2. Repositories
-    c.OrderRepo = orderStorage.NewOrderRepository(c.DB, c.TxManager)
+    c.OrderRepo = orderStorage.NewOrderRepository(c.DB)
 
     // 3. Services (with cross-domain adapters)
     paymentAdapter := orderService.NewPaymentClientAdapter(c.PaymentSvc)
-    c.OrderSvc = orderService.NewOrderService(c.OrderRepo, paymentAdapter)
+    c.OrderSvc = orderService.NewOrderService(c.OrderRepo, paymentAdapter, c.TxManager)
 
     return c, nil
 }
@@ -740,20 +769,67 @@ func handleShutdown(cancel context.CancelFunc) {
 
 ## Transaction Management
 
-Context-based transactions that propagate transparently through repositories.
+Context-based transactions that propagate transparently. The interface hides the ORM implementation from consumers.
 
 ```go
+// internal/common/transaction/manager.go
+package transaction
+
 type Manager interface {
-    ExecuteTx(ctx context.Context, fn func(ctx context.Context, tx *gorm.DB) error) error
-    GetTxFromContext(ctx context.Context) *gorm.DB
+    // ExecuteTx runs fn within a transaction. If fn returns an error, the
+    // transaction is rolled back; otherwise it commits.
+    ExecuteTx(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
 
-Usage in a service:
+Implementation (GORM-specific, lives in infrastructure):
+
+```go
+// internal/common/transaction/gorm.go
+package transaction
+
+type ctxKey struct{}
+
+type gormManager struct {
+    db *gorm.DB
+}
+
+func NewGormManager(db *gorm.DB) Manager {
+    return &gormManager{db: db}
+}
+
+func (m *gormManager) ExecuteTx(ctx context.Context, fn func(ctx context.Context) error) error {
+    return m.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        txCtx := context.WithValue(ctx, ctxKey{}, tx)
+        return fn(txCtx)
+    })
+}
+
+// GetTx retrieves the transaction from context. Called by repositories.
+func GetTx(ctx context.Context) *gorm.DB {
+    if tx, ok := ctx.Value(ctxKey{}).(*gorm.DB); ok {
+        return tx
+    }
+    return nil
+}
+```
+
+Repositories use a helper to get the active connection:
+
+```go
+func (r *orderRepository) getDB(ctx context.Context) *gorm.DB {
+    if tx := transaction.GetTx(ctx); tx != nil {
+        return tx
+    }
+    return r.db
+}
+```
+
+Usage in a service — no GORM types visible:
 
 ```go
 func (s *orderService) PlaceOrder(ctx context.Context, order *domain.Order) error {
-    return s.txManager.ExecuteTx(ctx, func(txCtx context.Context, tx *gorm.DB) error {
+    return s.txManager.ExecuteTx(ctx, func(txCtx context.Context) error {
         if err := s.orderRepo.Create(txCtx, order); err != nil {
             return err // automatic rollback
         }
@@ -765,7 +841,14 @@ func (s *orderService) PlaceOrder(ctx context.Context, order *domain.Order) erro
 }
 ```
 
-Any repository receiving `txCtx` automatically participates in the transaction via `getDB(ctx)`.
+### Handling Partial Failures
+
+When a transaction fails, the error should indicate which operation failed. Repositories wrap errors with context (see Error Handling), so the service receives errors like:
+
+- `"reserving inventory for order abc-123: insufficient stock for SKU xyz"`
+- `"creating order abc-123: conflict"`
+
+The service can inspect these with `errors.Is()` / `errors.As()` if it needs to handle specific failures differently, or simply propagate to the handler for logging and response.
 
 ## HTTP Layer
 
@@ -784,33 +867,69 @@ Any repository receiving `txCtx` automatically participates in the transaction v
 ```go
 func (s *Server) setupRoutes() {
     r := chi.NewRouter()
+
+    // Global middleware
+    r.Use(middleware.RequestID)
+    r.Use(middleware.Recoverer)
+
     r.Get("/health", healthCheck)
 
     r.Route("/api/v1", func(api chi.Router) {
         api.Use(middleware.CorsMiddleware(s.frontendURL))
-        api.Use(middleware.RequestID)
 
-        api.Route("/", func(protected chi.Router) {
+        // Public routes
+        api.Post("/auth/login", s.auth.Login)
+
+        // Protected routes
+        api.Group(func(protected chi.Router) {
             protected.Use(middleware.Authenticate)
 
             protected.Post("/orders", s.order.CreateOrder)
             protected.Get("/orders/{id}", s.order.GetOrder)
+            protected.Put("/orders/{id}", s.order.UpdateOrder)
+
+            // Admin-only routes
+            protected.Group(func(admin chi.Router) {
+                admin.Use(middleware.RequireRole("admin"))
+                admin.Delete("/orders/{id}", s.order.DeleteOrder)
+            })
         })
     })
+
+    s.router = r
 }
 ```
 
 #### Example: net/http (Go 1.22+)
+
+The stdlib router doesn't have built-in middleware chaining. Compose middleware manually or use a helper:
 
 ```go
 func (s *Server) setupRoutes() {
     mux := http.NewServeMux()
     mux.HandleFunc("GET /health", healthCheck)
 
-    mux.HandleFunc("POST /api/v1/orders", s.order.CreateOrder)
-    mux.HandleFunc("GET /api/v1/orders/{id}", s.order.GetOrder)
+    // Protected endpoints need manual middleware composition
+    mux.Handle("POST /api/v1/orders",
+        middleware.RequestID(
+            middleware.Authenticate(
+                http.HandlerFunc(s.order.CreateOrder),
+            ),
+        ),
+    )
+    mux.Handle("GET /api/v1/orders/{id}",
+        middleware.RequestID(
+            middleware.Authenticate(
+                http.HandlerFunc(s.order.GetOrder),
+            ),
+        ),
+    )
+
+    s.handler = mux
 }
 ```
+
+For APIs with many routes needing the same middleware stack, chi or a similar router is more practical.
 
 Route paths are defined as constants:
 ```go
@@ -875,53 +994,76 @@ func RequireRole(role string) func(http.Handler) http.Handler {
 
 ### Domain Errors
 
-Define domain-level sentinel errors that express business meaning without leaking infrastructure details:
+Define generic sentinel errors in a shared package. Domains add context through wrapping rather than defining domain-specific variants like `ErrOrderNotFound`.
 
 ```go
-// internal/common/errors.go
+// internal/common/errors/errors.go
+package commonerrors
+
+import "errors"
+
+// Sentinel errors for HTTP-mappable categories
 var (
-    ErrNotFound      = errors.New("not found")
-    ErrConflict      = errors.New("conflict")
-    ErrUnauthorized  = errors.New("unauthorized")
-    ErrForbidden     = errors.New("forbidden")
+    ErrNotFound     = errors.New("not found")
+    ErrConflict     = errors.New("conflict")
+    ErrUnauthorized = errors.New("unauthorized")
+    ErrForbidden    = errors.New("forbidden")
 )
-```
 
-For errors that carry additional context, use a custom type:
-
-```go
+// ValidationError carries field-level detail
 type ValidationError struct {
     Field   string
     Message string
 }
 
 func (e *ValidationError) Error() string {
-    return fmt.Sprintf("validation: %s — %s", e.Field, e.Message)
+    return fmt.Sprintf("%s: %s", e.Field, e.Message)
+}
+
+// ExternalServiceError wraps failures from third-party integrations
+type ExternalServiceError struct {
+    Service   string // "mpesa", "veriff", "teltonika"
+    Operation string // "charge", "verify_identity", "get_location"
+    Retryable bool
+    Cause     error
+}
+
+func (e *ExternalServiceError) Error() string {
+    return fmt.Sprintf("%s.%s: %v", e.Service, e.Operation, e.Cause)
+}
+
+func (e *ExternalServiceError) Unwrap() error {
+    return e.Cause
 }
 ```
 
-### Error Wrapping
+### Error Wrapping Guidelines
 
-Add context as errors propagate up through layers using `%w`. This preserves the original error for `errors.Is`/`errors.As` checks while making logs easier to trace:
+Wrap errors only when adding **meaningful context** the caller doesn't have. Function names alone add noise — they're already in stack traces.
 
 ```go
-// Repository layer
-func (r *OrderRepo) GetByID(ctx context.Context, id string) (*Order, error) {
-    var order Order
-    if err := r.db.WithContext(ctx).First(&order, "id = ?", id).Error; err != nil {
-        if errors.Is(err, gorm.ErrRecordNotFound) {
-            return nil, fmt.Errorf("order %s: %w", id, ErrNotFound)
-        }
-        return nil, fmt.Errorf("querying order %s: %w", id, err)
-    }
-    return &order, nil
-}
-
-// Service layer
-func (s *OrderService) GetOrder(ctx context.Context, id string) (*Order, error) {
+// ❌ Redundant — function name adds nothing
+func (s *OrderService) GetOrder(ctx context.Context, id uuid.UUID) (*domain.Order, error) {
     order, err := s.repo.GetByID(ctx, id)
     if err != nil {
-        return nil, fmt.Errorf("GetOrder: %w", err)
+        return nil, fmt.Errorf("GetOrder: %w", err)  // Don't do this
+    }
+    return order, nil
+}
+
+// ✅ No wrap needed — repo already added context
+func (s *OrderService) GetOrder(ctx context.Context, id uuid.UUID) (*domain.Order, error) {
+    return s.repo.GetByID(ctx, id)
+}
+
+// ✅ Meaningful context — adds info the repo didn't have
+func (s *OrderService) GetOrderForCustomer(ctx context.Context, customerID, orderID uuid.UUID) (*domain.Order, error) {
+    order, err := s.repo.GetByID(ctx, orderID)
+    if err != nil {
+        return nil, fmt.Errorf("customer %s: %w", customerID, err)
+    }
+    if order.CustomerID != customerID {
+        return nil, fmt.Errorf("order %s: %w", orderID, commonerrors.ErrNotFound)
     }
     return order, nil
 }
@@ -929,17 +1071,37 @@ func (s *OrderService) GetOrder(ctx context.Context, id string) (*Order, error) 
 
 ### Error Translation at Boundaries
 
-Adapters (repositories, external clients) translate infrastructure-specific errors into domain errors. The domain and service layers never see `sql.ErrNoRows`, `gorm.ErrRecordNotFound`, or HTTP status codes from third-party APIs:
+Adapters (repositories, external clients) translate infrastructure-specific errors into domain errors. The domain and service layers never see `gorm.ErrRecordNotFound`, `sql.ErrNoRows`, or HTTP status codes from third-party APIs.
 
 ```go
-// External client adapter
-func (c *PaymentClient) Charge(ctx context.Context, req ChargeRequest) error {
-    resp, err := c.http.Post(ctx, "/charge", req)
-    if err != nil {
-        return fmt.Errorf("payment charge: %w", err)
+// Repository translates GORM errors
+func (r *orderRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, error) {
+    var order domain.Order
+    if err := r.getDB(ctx).WithContext(ctx).First(&order, "id = ?", id).Error; err != nil {
+        if errors.Is(err, gorm.ErrRecordNotFound) {
+            return nil, fmt.Errorf("order %s: %w", id, commonerrors.ErrNotFound)
+        }
+        return nil, fmt.Errorf("querying order %s: %w", id, err)
     }
-    if resp.StatusCode == http.StatusConflict {
-        return fmt.Errorf("payment charge %s: %w", req.ID, ErrConflict)
+    return &order, nil
+}
+
+// External client translates HTTP errors
+func (c *PaymentClient) Charge(ctx context.Context, customerID uuid.UUID, amount float64) error {
+    resp, err := c.http.Post(ctx, "/charge", chargeRequest{CustomerID: customerID, Amount: amount})
+    if err != nil {
+        return &commonerrors.ExternalServiceError{
+            Service:   "mpesa",
+            Operation: "charge",
+            Retryable: isRetryable(err),
+            Cause:     err,
+        }
+    }
+    switch resp.StatusCode {
+    case http.StatusConflict:
+        return fmt.Errorf("charge customer %s: %w", customerID, commonerrors.ErrConflict)
+    case http.StatusUnprocessableEntity:
+        return &commonerrors.ValidationError{Field: "amount", Message: "insufficient funds"}
     }
     return nil
 }
@@ -947,42 +1109,60 @@ func (c *PaymentClient) Charge(ctx context.Context, req ChargeRequest) error {
 
 ### Centralized HTTP Error Mapping
 
-A single function in the API layer maps domain errors to HTTP responses. Handlers return errors; they don't decide status codes:
+A single function maps domain errors to HTTP responses. Handlers delegate to this function rather than deciding status codes themselves.
 
 ```go
-// internal/api/errors/errors.go
+// internal/api/errors/handler.go
+package apierrors
+
 type ErrorResponse struct {
-    Error       string `json:"error"`
-    Code        int    `json:"code"`
-    Description string `json:"description,omitempty"`
+    Code      string `json:"code"`                 // Stable code for integrators
+    Message   string `json:"message"`              // Human-readable
+    RequestID string `json:"request_id,omitempty"` // For support correlation
 }
 
-func HandleError(w http.ResponseWriter, err error) {
-    code, message := mapError(err)
+func HandleError(w http.ResponseWriter, r *http.Request, err error) {
+    code, status, message := mapError(err)
+    requestID, _ := r.Context().Value(middleware.RequestIDKey).(string)
 
-    // Log the full error server-side; return a sanitized message to the client
-    slog.Error("request failed", "error", err, "status", code)
+    // Log full error chain server-side
+    slog.ErrorContext(r.Context(), "request failed",
+        "error", err,
+        "status", status,
+        "code", code,
+        "request_id", requestID,
+    )
 
+    // Return sanitized response
     w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(code)
-    json.NewEncoder(w).Encode(ErrorResponse{Error: message, Code: code})
+    w.WriteHeader(status)
+    json.NewEncoder(w).Encode(ErrorResponse{
+        Code:      code,
+        Message:   message,
+        RequestID: requestID,
+    })
 }
 
-func mapError(err error) (int, string) {
-    var validationErr *ValidationError
+func mapError(err error) (code string, status int, message string) {
+    var validationErr *commonerrors.ValidationError
+    var externalErr *commonerrors.ExternalServiceError
+
     switch {
-    case errors.Is(err, ErrNotFound):
-        return http.StatusNotFound, "not found"
-    case errors.Is(err, ErrConflict):
-        return http.StatusConflict, "conflict"
-    case errors.Is(err, ErrUnauthorized):
-        return http.StatusUnauthorized, "unauthorized"
-    case errors.Is(err, ErrForbidden):
-        return http.StatusForbidden, "forbidden"
+    case errors.Is(err, commonerrors.ErrNotFound):
+        return "NOT_FOUND", http.StatusNotFound, "Resource not found"
+    case errors.Is(err, commonerrors.ErrConflict):
+        return "CONFLICT", http.StatusConflict, "Resource already exists"
+    case errors.Is(err, commonerrors.ErrUnauthorized):
+        return "UNAUTHORIZED", http.StatusUnauthorized, "Authentication required"
+    case errors.Is(err, commonerrors.ErrForbidden):
+        return "FORBIDDEN", http.StatusForbidden, "Access denied"
     case errors.As(err, &validationErr):
-        return http.StatusBadRequest, validationErr.Error()
+        return "VALIDATION_ERROR", http.StatusBadRequest, validationErr.Error()
+    case errors.As(err, &externalErr):
+        // Don't leak external service details to clients
+        return "SERVICE_UNAVAILABLE", http.StatusServiceUnavailable, "Downstream service error"
     default:
-        return http.StatusInternalServerError, "internal error"
+        return "INTERNAL_ERROR", http.StatusInternalServerError, "Internal error"
     }
 }
 ```
@@ -991,32 +1171,34 @@ Handlers stay clean:
 
 ```go
 func (h *OrderHandler) GetOrder(w http.ResponseWriter, r *http.Request) {
-    id := chi.URLParam(r, "id")
-    order, err := h.service.GetOrder(r.Context(), id)
+    id, err := uuid.Parse(chi.URLParam(r, "id"))
     if err != nil {
-        apierrors.HandleError(w, err)
+        apierrors.HandleError(w, r, &commonerrors.ValidationError{Field: "id", Message: "invalid UUID"})
         return
     }
-    writeJSON(w, http.StatusOK, order)
+
+    order, err := h.service.GetOrder(r.Context(), id)
+    if err != nil {
+        apierrors.HandleError(w, r, err)
+        return
+    }
+
+    writeJSON(w, http.StatusOK, dto.ToResponse(order))
 }
 ```
-
-**Design choice — Error response detail level:**
-
-| Option | Notes |
-|--------|-------|
-| **Minimal (recommended)** | Return generic messages (`"not found"`, `"internal error"`). Safest default — never leaks internals. |
-| **Descriptive** | Include a `description` field with more context for client developers. Useful during development but requires careful review to avoid leaking sensitive details. |
 
 ## Observability
 
 ### Structured Logging
 
-Use structured logging (slog, zerolog, or zap) with the request ID from context for log correlation:
+Use structured logging (slog, zerolog, or zap) with the request ID and trace ID from context for log correlation:
 
 ```go
 func LoggerFromContext(ctx context.Context) *slog.Logger {
     logger := slog.Default()
+    if spanCtx := trace.SpanContextFromContext(ctx); spanCtx.HasTraceID() {
+        logger = logger.With("trace_id", spanCtx.TraceID().String())
+    }
     if requestID, ok := ctx.Value(RequestIDKey).(string); ok {
         logger = logger.With("request_id", requestID)
     }
@@ -1076,7 +1258,7 @@ defer func() { _ = tp.Shutdown(context.Background()) }()
 
 #### HTTP Middleware
 
-Extract incoming trace context (or start a new trace) and create a span per request:
+Extract incoming trace context (or start a new trace), create a span per request, and record errors:
 
 ```go
 func Tracing(next http.Handler) http.Handler {
@@ -1086,8 +1268,42 @@ func Tracing(next http.Handler) http.Handler {
         ctx, span := tracer.Start(ctx, fmt.Sprintf("%s %s", r.Method, r.URL.Path))
         defer span.End()
 
-        next.ServeHTTP(w, r.WithContext(ctx))
+        // Wrap response writer to capture status code
+        wrapped := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+        next.ServeHTTP(wrapped, r.WithContext(ctx))
+
+        // Record error status on span
+        if wrapped.status >= 400 {
+            span.SetStatus(codes.Error, http.StatusText(wrapped.status))
+        }
     })
+}
+
+type statusRecorder struct {
+    http.ResponseWriter
+    status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+    r.status = code
+    r.ResponseWriter.WriteHeader(code)
+}
+```
+
+For errors caught in handlers or services, record them explicitly:
+
+```go
+import "go.opentelemetry.io/otel/codes"
+
+func (s *orderService) CreateOrder(ctx context.Context, order *domain.Order) error {
+    span := trace.SpanFromContext(ctx)
+
+    if err := s.repo.Create(ctx, order); err != nil {
+        span.RecordError(err)
+        span.SetStatus(codes.Error, "failed to create order")
+        return err
+    }
+    return nil
 }
 ```
 
@@ -1099,23 +1315,6 @@ When calling other services, inject the trace context into outgoing HTTP headers
 func (c *Client) do(ctx context.Context, req *http.Request) (*http.Response, error) {
     otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
     return c.http.Do(req)
-}
-```
-
-#### Connecting Logs to Traces
-
-Include the trace ID in structured log entries so logs and traces can be correlated:
-
-```go
-func LoggerFromContext(ctx context.Context) *slog.Logger {
-    logger := slog.Default()
-    if spanCtx := trace.SpanContextFromContext(ctx); spanCtx.HasTraceID() {
-        logger = logger.With("trace_id", spanCtx.TraceID().String())
-    }
-    if requestID, ok := ctx.Value(RequestIDKey).(string); ok {
-        logger = logger.With("request_id", requestID)
-    }
-    return logger
 }
 ```
 
@@ -1174,6 +1373,7 @@ Swagger annotations on handlers, served at `/swagger/` endpoint. Generated with 
 ## Testing
 
 - Standard Go testing with testify for assertions
+- Domain tests for rich domain models (pure logic, no dependencies)
 - Service tests mock repository and client adapter interfaces
 - Handler tests mock service interfaces
 - Repository/storage test approach depends on Decision 5 (Testing Strategy)
@@ -1184,13 +1384,14 @@ Swagger annotations on handlers, served at `/swagger/` endpoint. Generated with 
 | Component       | Technology       |
 |-----------------|------------------|
 | Language        | Go               |
-| Web Framework   | chi / net/http (stdlib) / Gorilla Mux |
+| Web Framework   | chi / net/http (stdlib) |
 | ORM             | GORM             |
 | Database        | PostgreSQL       |
 | Authentication  | JWT              |
 | API Docs        | Swagger/OpenAPI  |
-| Testing         | testify          |
+| Testing         | testify, testcontainers |
 | Logging         | slog / zerolog   |
+| Tracing         | OpenTelemetry    |
 | Containerization| Docker           |
 
 ## Architectural Principles
@@ -1204,4 +1405,5 @@ Swagger annotations on handlers, served at `/swagger/` endpoint. Generated with 
 7. **UUID primary keys** — better for distributed systems
 8. **Batch-friendly endpoints** — handlers accept both single items and arrays where appropriate
 9. **Explicit validation at the boundary** — every request DTO validates input before conversion to domain
-10. **Structured observability** — request IDs propagated via context, structured logging across all layers
+10. **Structured observability** — request IDs and trace IDs propagated via context, structured logging across all layers
+11. **Error translation at boundaries** — adapters translate infrastructure errors to domain errors; handlers map domain errors to HTTP responses
