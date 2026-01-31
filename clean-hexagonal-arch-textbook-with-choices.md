@@ -656,21 +656,44 @@ Any repository receiving `txCtx` automatically participates in the transaction v
 
 ### Routing
 
-Gorilla Mux with subrouters for middleware scoping.
+**Design choice — Router:**
+
+| Option | Notes |
+|--------|-------|
+| **net/http (stdlib)** | Go 1.22+ added method routing and path parameters (`{id}`). Zero dependencies, good enough for most APIs. |
+| **chi** | Lightweight, idiomatic, fully compatible with `net/http`. Supports middleware groups and subrouters. Actively maintained. |
+| **Gorilla Mux** | Feature-rich but the original team archived it. Now community-maintained under github.com/gorilla — evaluate maintenance status before adopting. |
+
+#### Example: chi
 
 ```go
 func (s *Server) setupRoutes() {
-    s.base.HandleFunc("/health", healthCheck)
+    r := chi.NewRouter()
+    r.Get("/health", healthCheck)
 
-    api := s.base.PathPrefix("/api/v1").Subrouter()
-    api.Use(middleware.CorsMiddleware(s.frontendURL))
-    api.Use(middleware.RequestID)
+    r.Route("/api/v1", func(api chi.Router) {
+        api.Use(middleware.CorsMiddleware(s.frontendURL))
+        api.Use(middleware.RequestID)
 
-    protected := api.PathPrefix("").Subrouter()
-    protected.Use(middleware.Authenticate)
+        api.Route("/", func(protected chi.Router) {
+            protected.Use(middleware.Authenticate)
 
-    protected.HandleFunc("/orders", s.order.CreateOrder).Methods("POST")
-    protected.HandleFunc("/orders/{id}", s.order.GetOrder).Methods("GET")
+            protected.Post("/orders", s.order.CreateOrder)
+            protected.Get("/orders/{id}", s.order.GetOrder)
+        })
+    })
+}
+```
+
+#### Example: net/http (Go 1.22+)
+
+```go
+func (s *Server) setupRoutes() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /health", healthCheck)
+
+    mux.HandleFunc("POST /api/v1/orders", s.order.CreateOrder)
+    mux.HandleFunc("GET /api/v1/orders/{id}", s.order.GetOrder)
 }
 ```
 
@@ -818,7 +841,7 @@ Swagger annotations on handlers, served at `/swagger/` endpoint. Generated with 
 | Component       | Technology       |
 |-----------------|------------------|
 | Language        | Go               |
-| Web Framework   | Gorilla Mux      |
+| Web Framework   | chi / net/http (stdlib) / Gorilla Mux |
 | ORM             | GORM             |
 | Database        | PostgreSQL       |
 | Authentication  | JWT              |
