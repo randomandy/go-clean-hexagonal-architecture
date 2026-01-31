@@ -756,22 +756,142 @@ func RequireRole(role string) func(http.Handler) http.Handler {
 
 **CORS** — configurable allowed origin with preflight support.
 
-### Error Responses
+## Error Handling
 
-Standardized JSON error format:
+### Domain Errors
+
+Define domain-level sentinel errors that express business meaning without leaking infrastructure details:
+
 ```go
+// internal/common/errors.go
+var (
+    ErrNotFound      = errors.New("not found")
+    ErrConflict      = errors.New("conflict")
+    ErrUnauthorized  = errors.New("unauthorized")
+    ErrForbidden     = errors.New("forbidden")
+)
+```
+
+For errors that carry additional context, use a custom type:
+
+```go
+type ValidationError struct {
+    Field   string
+    Message string
+}
+
+func (e *ValidationError) Error() string {
+    return fmt.Sprintf("validation: %s — %s", e.Field, e.Message)
+}
+```
+
+### Error Wrapping
+
+Add context as errors propagate up through layers using `%w`. This preserves the original error for `errors.Is`/`errors.As` checks while making logs easier to trace:
+
+```go
+// Repository layer
+func (r *OrderRepo) GetByID(ctx context.Context, id string) (*Order, error) {
+    var order Order
+    if err := r.db.WithContext(ctx).First(&order, "id = ?", id).Error; err != nil {
+        if errors.Is(err, gorm.ErrRecordNotFound) {
+            return nil, fmt.Errorf("order %s: %w", id, ErrNotFound)
+        }
+        return nil, fmt.Errorf("querying order %s: %w", id, err)
+    }
+    return &order, nil
+}
+
+// Service layer
+func (s *OrderService) GetOrder(ctx context.Context, id string) (*Order, error) {
+    order, err := s.repo.GetByID(ctx, id)
+    if err != nil {
+        return nil, fmt.Errorf("GetOrder: %w", err)
+    }
+    return order, nil
+}
+```
+
+### Error Translation at Boundaries
+
+Adapters (repositories, external clients) translate infrastructure-specific errors into domain errors. The domain and service layers never see `sql.ErrNoRows`, `gorm.ErrRecordNotFound`, or HTTP status codes from third-party APIs:
+
+```go
+// External client adapter
+func (c *PaymentClient) Charge(ctx context.Context, req ChargeRequest) error {
+    resp, err := c.http.Post(ctx, "/charge", req)
+    if err != nil {
+        return fmt.Errorf("payment charge: %w", err)
+    }
+    if resp.StatusCode == http.StatusConflict {
+        return fmt.Errorf("payment charge %s: %w", req.ID, ErrConflict)
+    }
+    return nil
+}
+```
+
+### Centralized HTTP Error Mapping
+
+A single function in the API layer maps domain errors to HTTP responses. Handlers return errors; they don't decide status codes:
+
+```go
+// internal/api/errors/errors.go
 type ErrorResponse struct {
     Error       string `json:"error"`
     Code        int    `json:"code"`
     Description string `json:"description,omitempty"`
 }
 
-func WriteErrorResponse(w http.ResponseWriter, code int, message, description string) {
+func HandleError(w http.ResponseWriter, err error) {
+    code, message := mapError(err)
+
+    // Log the full error server-side; return a sanitized message to the client
+    slog.Error("request failed", "error", err, "status", code)
+
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(code)
-    json.NewEncoder(w).Encode(ErrorResponse{Error: message, Code: code, Description: description})
+    json.NewEncoder(w).Encode(ErrorResponse{Error: message, Code: code})
+}
+
+func mapError(err error) (int, string) {
+    var validationErr *ValidationError
+    switch {
+    case errors.Is(err, ErrNotFound):
+        return http.StatusNotFound, "not found"
+    case errors.Is(err, ErrConflict):
+        return http.StatusConflict, "conflict"
+    case errors.Is(err, ErrUnauthorized):
+        return http.StatusUnauthorized, "unauthorized"
+    case errors.Is(err, ErrForbidden):
+        return http.StatusForbidden, "forbidden"
+    case errors.As(err, &validationErr):
+        return http.StatusBadRequest, validationErr.Error()
+    default:
+        return http.StatusInternalServerError, "internal error"
+    }
 }
 ```
+
+Handlers stay clean:
+
+```go
+func (h *OrderHandler) GetOrder(w http.ResponseWriter, r *http.Request) {
+    id := chi.URLParam(r, "id")
+    order, err := h.service.GetOrder(r.Context(), id)
+    if err != nil {
+        apierrors.HandleError(w, err)
+        return
+    }
+    writeJSON(w, http.StatusOK, order)
+}
+```
+
+**Design choice — Error response detail level:**
+
+| Option | Notes |
+|--------|-------|
+| **Minimal (recommended)** | Return generic messages (`"not found"`, `"internal error"`). Safest default — never leaks internals. |
+| **Descriptive** | Include a `description` field with more context for client developers. Useful during development but requires careful review to avoid leaking sensitive details. |
 
 ## Observability
 
@@ -800,6 +920,113 @@ func (s *orderService) CreateOrder(ctx context.Context, order *domain.Order) err
 ```
 
 This enables filtering all logs for a single request or user across all layers.
+
+### Distributed Tracing
+
+In a multi-service architecture, a single user request may span several services. Use OpenTelemetry to propagate trace context across service boundaries so you can follow a request end-to-end.
+
+#### Tracer Setup
+
+Initialize a tracer provider at application startup in the bootstrap layer:
+
+```go
+// internal/bootstrap/tracing.go
+func InitTracer(ctx context.Context, serviceName string) (*sdktrace.TracerProvider, error) {
+    exporter, err := newExporter(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("creating trace exporter: %w", err)
+    }
+
+    tp := sdktrace.NewTracerProvider(
+        sdktrace.WithBatcher(exporter),
+        sdktrace.WithResource(resource.NewWithAttributes(
+            semconv.SchemaURL,
+            semconv.ServiceNameKey.String(serviceName),
+        )),
+    )
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+        propagation.TraceContext{},
+        propagation.Baggage{},
+    ))
+    return tp, nil
+}
+```
+
+Shut it down gracefully on application exit to flush pending spans:
+
+```go
+defer func() { _ = tp.Shutdown(context.Background()) }()
+```
+
+#### HTTP Middleware
+
+Extract incoming trace context (or start a new trace) and create a span per request:
+
+```go
+func Tracing(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+        tracer := otel.Tracer("api")
+        ctx, span := tracer.Start(ctx, fmt.Sprintf("%s %s", r.Method, r.URL.Path))
+        defer span.End()
+
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+```
+
+#### Propagating Context to Outgoing Calls
+
+When calling other services, inject the trace context into outgoing HTTP headers so the downstream service continues the same trace:
+
+```go
+func (c *Client) do(ctx context.Context, req *http.Request) (*http.Response, error) {
+    otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+    return c.http.Do(req)
+}
+```
+
+#### Connecting Logs to Traces
+
+Include the trace ID in structured log entries so logs and traces can be correlated:
+
+```go
+func LoggerFromContext(ctx context.Context) *slog.Logger {
+    logger := slog.Default()
+    if spanCtx := trace.SpanContextFromContext(ctx); spanCtx.HasTraceID() {
+        logger = logger.With("trace_id", spanCtx.TraceID().String())
+    }
+    if requestID, ok := ctx.Value(RequestIDKey).(string); ok {
+        logger = logger.With("request_id", requestID)
+    }
+    return logger
+}
+```
+
+#### Async / Queue Propagation
+
+For messages published to queues (e.g., RabbitMQ, SQS), inject trace context into message headers on the producer side and extract it on the consumer side, using the same `TextMapPropagator`:
+
+```go
+// Producer
+carrier := propagation.MapCarrier{}
+otel.GetTextMapPropagator().Inject(ctx, carrier)
+// attach carrier as message headers
+
+// Consumer
+ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+```
+
+**Design choice — Tracing backend:**
+
+| Option | Notes |
+|--------|-------|
+| **Jaeger** | Open source, self-hosted, well-established. Good for teams that want full control. |
+| **Grafana Tempo** | Pairs naturally with Grafana/Loki stacks. Cost-efficient object-storage backend. |
+| **Cloud-native (Datadog, AWS X-Ray, GCP Cloud Trace)** | Managed, minimal ops overhead. Best when already invested in a cloud platform. |
+
+All options work with the same OpenTelemetry SDK — only the exporter changes.
 
 ## Configuration
 
