@@ -14,6 +14,10 @@ I welcome comments and collaboration. Never stop learning.
 
 Andy
 
+## AI Disclaimer
+
+I've obviously thrown my draft at claude for finishing touches, cleaning up my typos, and improve the overall formatting and style. The content does come from myself, and Claude only did some polishing.
+
 ## Guides
 
 ### [Project-Based Clean Hexagonal Architecture](project-based-clean-hexagonal-arch.md)
