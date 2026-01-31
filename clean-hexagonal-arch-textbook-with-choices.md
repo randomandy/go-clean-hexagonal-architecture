@@ -25,7 +25,7 @@ A reference architecture for building Go REST APIs using Clean Architecture and 
 │       ├── ports/                 # Interface definitions (service + repository)
 │       ├── service/               # Business logic implementation
 │       ├── storage/               # Database persistence (GORM)
-│       │   └── model/             # (Option B only) Separate persistence models
+│       │   └── model/             # Separate persistence models (Decision 1 Option B)
 │       ├── dto/                   # Request/response data transfer objects
 │       └── api/                   # HTTP handlers
 ├── external/                      # External service integrations
@@ -33,7 +33,7 @@ A reference architecture for building Go REST APIs using Clean Architecture and 
 └── docs/                          # Swagger/OpenAPI documentation
 ```
 
----
+> This tree shows the superset of all directories. Some are conditional on design decisions (noted inline).
 
 ## Design Decisions
 
@@ -285,7 +285,7 @@ func TestCreateOrder(t *testing.T) {
 
     svc := service.NewOrderService(repo)
     err := svc.CreateOrder(context.Background(), &domain.Order{ID: uuid.New()})
-    assert.NoError(t, err)
+    require.NoError(t, err)
 }
 ```
 
@@ -583,13 +583,12 @@ func (r *CreateOrderRequest) Validate() error {
     return nil
 }
 
+// ToDomain converts request data only — business defaults (ID, status, timestamps)
+// are set by the service layer.
 func (r *CreateOrderRequest) ToDomain() *domain.Order {
     return &domain.Order{
-        ID:         uuid.New(),
         CustomerID: r.CustomerID,
-        Status:     domain.OrderStatusPending,
-        CreatedAt:  time.Now(),
-        UpdatedAt:  time.Now(),
+        Items:      toItemsDomain(r.Items),
     }
 }
 
@@ -611,6 +610,61 @@ func ToResponse(order *domain.Order) *OrderResponse {
     }
 }
 ```
+
+#### Batch-Friendly Endpoints
+
+For operations that benefit from bulk processing, define batch request/response types alongside the single-item versions. The handler accepts an array, validates each item, and delegates to a service method that operates on the full batch:
+
+```go
+// dto/order.go
+type CreateOrdersBatchRequest struct {
+    Orders []CreateOrderRequest `json:"orders"`
+}
+
+func (r *CreateOrdersBatchRequest) Validate() error {
+    if len(r.Orders) == 0 {
+        return errors.New("at least one order is required")
+    }
+    for i, o := range r.Orders {
+        if err := o.Validate(); err != nil {
+            return fmt.Errorf("orders[%d]: %w", i, err)
+        }
+    }
+    return nil
+}
+
+func (r *CreateOrdersBatchRequest) ToDomain() []*domain.Order {
+    orders := make([]*domain.Order, len(r.Orders))
+    for i, o := range r.Orders {
+        orders[i] = o.ToDomain()
+    }
+    return orders
+}
+
+type CreateOrdersBatchResponse struct {
+    Orders []*OrderResponse `json:"orders"`
+}
+```
+
+The service and repository layers follow the same pattern — a `CreateBatch` method that operates on a slice:
+
+```go
+// ports/service.go
+type OrderService interface {
+    CreateOrder(ctx context.Context, order *domain.Order) error
+    CreateOrders(ctx context.Context, orders []*domain.Order) error
+    // ...
+}
+
+// ports/repository.go
+type OrderRepository interface {
+    Create(ctx context.Context, order *domain.Order) error
+    CreateBatch(ctx context.Context, orders []*domain.Order) error
+    // ...
+}
+```
+
+This avoids N+1 round-trips for bulk operations while keeping the single-item path simple.
 
 ### 6. API Handlers (`api/`)
 
@@ -658,7 +712,7 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 
 #### Reducing Handler Boilerplate
 
-Handlers follow a repetitive pattern: decode, validate, call service, handle errors, write response. A generic helper eliminates this duplication:
+Handlers that accept a request body follow a repetitive pattern: decode, validate, call service, handle errors, write response. A generic helper eliminates this duplication for POST/PUT endpoints:
 
 ```go
 // common/api/handler.go
@@ -699,6 +753,9 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
         return dto.ToResponse(order), nil
     }, http.StatusCreated)
 }
+
+// GET endpoints that read path/query parameters don't use Handle — they remain explicit
+// (see the GetOrder handler example in the Error Handling section).
 ```
 
 ## Dependency Injection
@@ -860,7 +917,8 @@ The service can inspect these with `errors.Is()` / `errors.As()` if it needs to 
 |--------|-------|
 | **net/http (stdlib)** | Go 1.22+ added method routing and path parameters (`{id}`). Zero dependencies, good enough for most APIs. |
 | **chi** | Lightweight, idiomatic, fully compatible with `net/http`. Supports middleware groups and subrouters. Actively maintained. |
-| **Gorilla Mux** | Feature-rich but the original team archived it. Now community-maintained under github.com/gorilla — evaluate maintenance status before adopting. |
+
+> **Note:** Gorilla Mux was a popular choice historically but was archived by the original team. It is now community-maintained under github.com/gorilla. For new projects, chi or the stdlib are safer bets.
 
 #### Example: chi
 
@@ -882,7 +940,7 @@ func (s *Server) setupRoutes() {
 
         // Protected routes
         api.Group(func(protected chi.Router) {
-            protected.Use(middleware.Authenticate)
+            protected.Use(middleware.Authenticate(s.tokenValidator))
 
             protected.Post("/orders", s.order.CreateOrder)
             protected.Get("/orders/{id}", s.order.GetOrder)
@@ -912,14 +970,14 @@ func (s *Server) setupRoutes() {
     // Protected endpoints need manual middleware composition
     mux.Handle("POST /api/v1/orders",
         middleware.RequestID(
-            middleware.Authenticate(
+            middleware.Authenticate(s.tokenValidator)(
                 http.HandlerFunc(s.order.CreateOrder),
             ),
         ),
     )
     mux.Handle("GET /api/v1/orders/{id}",
         middleware.RequestID(
-            middleware.Authenticate(
+            middleware.Authenticate(s.tokenValidator)(
                 http.HandlerFunc(s.order.GetOrder),
             ),
         ),
@@ -956,19 +1014,25 @@ func RequestID(next http.Handler) http.Handler {
 }
 ```
 
-**JWT Authentication** — extracts and validates Bearer token, stores claims in context:
+**JWT Authentication** — extracts and validates Bearer token, stores claims in context. The validator is injected to avoid coupling middleware to a concrete service package:
 ```go
-func Authenticate(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        token := extractBearerToken(r)
-        claims, err := service.ValidateToken(token)
-        if err != nil {
-            http.Error(w, "Unauthorized", http.StatusUnauthorized)
-            return
-        }
-        ctx := context.WithValue(r.Context(), UserClaimsKey, claims)
-        next.ServeHTTP(w, r.WithContext(ctx))
-    })
+type TokenValidator interface {
+    ValidateToken(token string) (*Claims, error)
+}
+
+func Authenticate(validator TokenValidator) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            token := extractBearerToken(r)
+            claims, err := validator.ValidateToken(token)
+            if err != nil {
+                http.Error(w, "Unauthorized", http.StatusUnauthorized)
+                return
+            }
+            ctx := context.WithValue(r.Context(), UserClaimsKey, claims)
+            next.ServeHTTP(w, r.WithContext(ctx))
+        })
+    }
 }
 ```
 
@@ -977,7 +1041,11 @@ func Authenticate(next http.Handler) http.Handler {
 func RequireRole(role string) func(http.Handler) http.Handler {
     return func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            claims := r.Context().Value(UserClaimsKey).(*service.Claims)
+            claims, ok := r.Context().Value(UserClaimsKey).(*Claims)
+            if !ok || claims == nil {
+                http.Error(w, "Unauthorized", http.StatusUnauthorized)
+                return
+            }
             if claims.Role != role && claims.Role != "admin" {
                 http.Error(w, "Forbidden", http.StatusForbidden)
                 return
@@ -1022,8 +1090,8 @@ func (e *ValidationError) Error() string {
 
 // ExternalServiceError wraps failures from third-party integrations
 type ExternalServiceError struct {
-    Service   string // "mpesa", "veriff", "teltonika"
-    Operation string // "charge", "verify_identity", "get_location"
+    Service   string // "payment", "identity", "shipping"
+    Operation string // "charge", "verify", "get_status"
     Retryable bool
     Cause     error
 }
@@ -1091,7 +1159,7 @@ func (c *PaymentClient) Charge(ctx context.Context, customerID uuid.UUID, amount
     resp, err := c.http.Post(ctx, "/charge", chargeRequest{CustomerID: customerID, Amount: amount})
     if err != nil {
         return &commonerrors.ExternalServiceError{
-            Service:   "mpesa",
+            Service:   "payment",
             Operation: "charge",
             Retryable: isRetryable(err),
             Cause:     err,
@@ -1228,6 +1296,15 @@ Initialize a tracer provider at application startup in the bootstrap layer:
 
 ```go
 // internal/bootstrap/tracing.go
+
+// newExporter returns a span exporter for the chosen backend.
+// Swap the implementation depending on the tracing backend (see design choice below).
+// Examples:
+//   Jaeger:       jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(url)))
+//   OTLP/gRPC:    otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(url))
+//   Stdout (dev): stdouttrace.New(stdouttrace.WithPrettyPrint())
+func newExporter(ctx context.Context) (sdktrace.SpanExporter, error) { /* ... */ }
+
 func InitTracer(ctx context.Context, serviceName string) (*sdktrace.TracerProvider, error) {
     exporter, err := newExporter(ctx)
     if err != nil {
